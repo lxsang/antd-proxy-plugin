@@ -77,21 +77,22 @@ static void *proxy_monitor_data(void *data)
     char buf[BUFFLEN];
     int sz;
     memset(buf, '\0', BUFFLEN);
-    sz = read_buf(proxy_cl, buf, BUFFLEN);
+    //char *method = (char *)dvalue(rq->request, "METHOD");
+    sz = recv(proxy_cl->sock, buf, BUFFLEN, 0);
     if (sz > 0)
     {
         antd_send(rq->client, buf, sz);
-        if (rq->client->state > 0)
+        if (proxy_cl->state > 0)
         {
-            rq->client->state -= sz;
-            if (rq->client->state <= 0)
+            proxy_cl->state -= sz;
+            if (proxy_cl->state <= 0)
             {
                 (void)close(proxy_cl->sock);
                 return task;
             }
         }
     }
-    if (sz == 0 && rq->client->state < 0)
+    if (sz == 0 && proxy_cl->state < 0)
     {
         (void)close(proxy_cl->sock);
         return task;
@@ -99,12 +100,16 @@ static void *proxy_monitor_data(void *data)
 
     if (sz < 0)
     {
-        (void)close(proxy_cl->sock);
-        return task;
+        //if(errno != EAGAIN && errno != EWOULDBLOCK)
+        {
+            (void)close(proxy_cl->sock);
+            return task;
+        }
     }
     task->handle = proxy_monitor_data;
     task->access_time = rq->client->last_io;
     antd_task_bind_event(task, rq->client->sock, 0, TASK_EVT_ON_WRITABLE | TASK_EVT_ON_READABLE);
+    antd_task_bind_event(task, proxy_cl->sock, 0, TASK_EVT_ON_READABLE);
     return task;
 }
 
@@ -114,119 +119,167 @@ static void *proxy_monitor_header(void *data)
     antd_client_t *proxy_cl = (antd_client_t *)dvalue(rq->request, "PROXY");
     antd_task_t *task = antd_create_task(NULL, data, NULL, rq->client->last_io);
 
-    int ret, clen = -1;
-    
-    struct pollfd pfd[1];
+    int ret;
     char buf[BUFFLEN];
-    memset(pfd, 0, sizeof(struct pollfd));
     memset(buf, '\0', BUFFLEN);
-    pfd[0].fd = proxy_cl->sock;
-    pfd[0].events = POLLIN;
-    // select
-    antd_response_header_t rhd;
-    rhd.header = dict();
-    rhd.cookie = list_init();
-    rhd.status = 200;
     regmatch_t matches[3];
-    char *k;
     char *v;
     int len;
-    ret = poll(pfd, 1, POLL_EVENT_TO);
+    do {
+        ret = read_buf(proxy_cl, buf, BUFFLEN);
+        if (ret > 0)
+        {
+            if (EQU(buf, "\r\n"))
+            {
+                (void)__b(rq->client, (const unsigned char*)"\r\n", 2);
+                task->access_time = rq->client->last_io;
+                antd_task_bind_event(task, proxy_cl->sock, 0, TASK_EVT_ON_READABLE);
+                antd_task_bind_event(task, rq->client->sock, 0, TASK_EVT_ON_WRITABLE | TASK_EVT_ON_READABLE);
+                task->handle = proxy_monitor_data;
+                return task;
+            }
+            else
+            {
+                trim(buf, '\n');
+                trim(buf, '\r');
+                __t(rq->client, "%s", buf);
+                if (regex_match("^Content\\-Length\\s*:\\s*(.*)$", buf, 2, matches))
+                {
+                    len = matches[1].rm_eo - matches[1].rm_so;
+                    v = (char *)malloc(len);
+                    memset(v, 0, len);
+                    memcpy(v, buf + matches[1].rm_so, len);
+                    proxy_cl->state = atoi(v);
+                    free(v);
+                }
+            }
+        }
+    } while (ret > 0);
+    task->handle = proxy_monitor_header;
+    task->access_time = rq->client->last_io;
+    antd_task_bind_event(task, proxy_cl->sock, 0, TASK_EVT_ON_READABLE);
+    antd_task_bind_event(task, rq->client->sock, 0, TASK_EVT_ON_WRITABLE | TASK_EVT_ON_READABLE);
+    return task;
+}
+
+static void *proxy_send_post_data(void *data)
+{
+    char buf[BUFFLEN];
+    antd_request_t *rq = (antd_request_t *)data;
+    antd_client_t *proxy_cl = (antd_client_t *)dvalue(rq->request, "PROXY");
+    antd_task_t *task = antd_create_task(NULL, data, NULL, rq->client->last_io);
+    memset(buf, '\0', BUFFLEN);
+    int ret = antd_recv_upto(rq->client, buf, BUFFLEN);
     if (ret < 0)
     {
-        ERROR("Unable to poll proxy fd %d", proxy_cl->sock);
+        ERROR("Unable to read request content");
+        antd_error(rq->client, 400, "Unable to read request content");
         (void)close(proxy_cl->sock);
         return task;
     }
     if (ret > 0)
     {
-        if (
-            pfd[0].revents & POLLERR ||
-            pfd[0].revents & POLLRDHUP ||
-            pfd[0].revents & POLLHUP ||
-            pfd[0].revents & POLLNVAL)
+        proxy_cl->state -= ret;
+        if (antd_send(proxy_cl, buf, ret) != ret)
         {
-            ERROR("Poll error event raised:");
-            ERROR("POLLERR: %d", pfd[0].revents & POLLERR);
-            ERROR("POLLRDHUP: %d", pfd[0].revents & POLLRDHUP);
-            ERROR("POLLHUP: %d", pfd[0].revents & POLLHUP);
-            ERROR("POLLNVAL: %d", pfd[0].revents & POLLNVAL);
+            ERROR("Unable to send request body to peer");
+            antd_error(rq->client, 500, "Unable to send request content via proxy");
             (void)close(proxy_cl->sock);
             return task;
         }
+    }
+    if (proxy_cl->state <= 0)
+    {
+        task->handle = proxy_monitor_header;
+        antd_task_bind_event(task, proxy_cl->sock, 0, TASK_EVT_ON_READABLE);
+    }
+    else
+    {
+        task->handle = proxy_send_post_data;
+        antd_task_bind_event(task, proxy_cl->sock, 0, TASK_EVT_ON_WRITABLE);
+    }
+    task->access_time = rq->client->last_io;
+    //antd_task_bind_event(task, rq->client->sock, 0, TASK_EVT_ON_WRITABLE | TASK_EVT_ON_READABLE);
+    return task;
+}
 
-        if ((pfd[0].revents & POLLIN))
+static int proxy_send_header(antd_request_t *rq, antd_client_t *proxy_cl)
+{
+    char *str;
+    int ret, size;
+    struct pollfd pfd[1];
+    char *query = (char *)dvalue(rq->request, "REQUEST_QUERY");
+    dictionary_t xheader = dvalue(rq->request, "REQUEST_HEADER");
+    char *method = (char *)dvalue(rq->request, "METHOD");
+    char *clen_str = (char *)dvalue(xheader, "Content-Length");
+
+    memset(pfd, 0, sizeof(struct pollfd));
+    pfd[0].fd = proxy_cl->sock;
+    pfd[0].events = POLLOUT;
+    chain_t it;
+    str = __s("%s %s HTTP/1.1\r\n", method, query);
+    size = strlen(str);
+    ret = antd_send(proxy_cl, str, size);
+    free(str);
+
+    for_each_assoc(it, xheader)
+    {
+        ret = 0;
+        ret = poll(pfd, 1, -1);
+        if (ret < 0)
         {
-            while (read_buf(proxy_cl, buf, BUFFLEN) > 0 && strcmp(buf, "\r\n") != 0)
+            ERROR("Unable to poll proxy fd %d", proxy_cl->sock);
+            (void)close(proxy_cl->sock);
+            return -1;
+        }
+        if (ret > 0)
+        {
+            if (
+                pfd[0].revents & POLLERR ||
+                pfd[0].revents & POLLRDHUP ||
+                pfd[0].revents & POLLHUP ||
+                pfd[0].revents & POLLNVAL)
             {
-                trim(buf, '\n');
-                trim(buf, '\r');
-                if (regex_match("\\s*HTTP/1\\.1\\s+([0-9]{3})\\s+([a-zA-Z0-9]*)", buf, 3, matches))
+                ERROR("Poll error event raised:");
+                ERROR("POLLERR: %d", pfd[0].revents & POLLERR);
+                ERROR("POLLRDHUP: %d", pfd[0].revents & POLLRDHUP);
+                ERROR("POLLHUP: %d", pfd[0].revents & POLLHUP);
+                ERROR("POLLNVAL: %d", pfd[0].revents & POLLNVAL);
+                (void)close(proxy_cl->sock);
+                return -1;
+            }
+
+            if ((pfd[0].revents & POLLOUT))
+            {
+                str = __s("%s: %s\r\n", it->key, (char *)it->value);
+                size = strlen(str);
+                ret = 0;
+                ret = antd_send(proxy_cl, str, size);
+                free(str);
+                if (ret != size)
                 {
-                    len = matches[1].rm_eo - matches[1].rm_so;
-                    k = (char *)malloc(len);
-                    memset(k, 0, len);
-                    memcpy(k, buf + matches[1].rm_so, len);
-                    rhd.status = atoi(k);
-                    free(k);
-                }
-                else if (regex_match("^([a-zA-Z0-9\\-]+)\\s*:\\s*(.*)$", buf, 3, matches))
-                {
-                    len = matches[1].rm_eo - matches[1].rm_so;
-                    k = (char *)malloc(len + 1);
-                    memcpy(k, buf + matches[1].rm_so, len);
-                    k[len] = '\0';
-                    verify_header(k);
-                    len = matches[2].rm_eo - matches[2].rm_so;
-                    v = (char *)malloc(len + 1);
-                    memcpy(v, buf + matches[2].rm_so, len);
-                    v[len] = '\0';
-                    if (strcmp(k, "Set-Cookie") == 0)
-                    {
-                        list_put_ptr(&rhd.cookie, v);
-                    }
-                    else
-                    {
-                        dput(rhd.header, k, v);
-                    }
-                    free(k);
-                }
-                else
-                {
-                    LOG("Ignore invalid header: %s", buf);
+                    ERROR("Unable to send headers to proxy sent %d expected %d", ret, size);
+                    (void)close(proxy_cl->sock);
+                    return -1;
                 }
             }
-            v = dvalue(rhd.header, "Content-Length");
-            if (v)
-            {
-                clen = atoi(v);
-            }
-            rq->client->state = clen;
-            antd_send_header(rq->client, &rhd);
-            antd_task_bind_event(task, rq->client->sock, 0,  TASK_EVT_ON_WRITABLE | TASK_EVT_ON_READABLE);
-            task->handle = proxy_monitor_data;
-            return task;
         }
     }
-
-    task->handle = proxy_monitor_header;
-    task->access_time = rq->client->last_io;
-    return task;
+    (void)antd_send(proxy_cl, "\r\n", 2);
+    if (clen_str)
+        return atoi(clen_str);
+    return 0;
 }
 
 void *handle(void *data)
 {
-    char *str = NULL;
     char buf[BUFFLEN];
-    int ret, size, fd;
-    chain_t it;
+    int size, fd;
     antd_request_t *rq = (antd_request_t *)data;
-    char *query = (char *)dvalue(rq->request, "REQUEST_QUERY");
-    dictionary_t xheader = dvalue(rq->request, "REQUEST_HEADER");
     char *path = (char *)dvalue(rq->request, "RESOURCE_PATH");
     char *www = (char *)dvalue(rq->request, "SERVER_WWW_ROOT");
     char *method = (char *)dvalue(rq->request, "METHOD");
-    char *clen_str = (char *)dvalue(xheader, "Content-Length");
+    char *str;
     antd_proxy_t proxy;
     antd_client_t *proxy_cl = NULL;
     antd_task_t *task = antd_create_task(NULL, data, NULL, rq->client->last_io);
@@ -274,9 +327,11 @@ void *handle(void *data)
         antd_error(rq->client, 503, "Service Unavailable");
         return task;
     }
-    //set_nonblock(proxy.fd);
+    set_nonblock(proxy.fd);
+
+    /*
     struct timeval timeout;
-    timeout.tv_sec = 0;
+    timeout.tv_sec = 10;
     timeout.tv_usec = POLL_EVENT_TO*1000;
     if (setsockopt(proxy.fd, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout, sizeof(timeout)) < 0)
     {
@@ -292,7 +347,7 @@ void *handle(void *data)
         antd_error(rq->client, 500, "Internal proxy error");
         (void)close(proxy.fd);
         return task;
-    }
+    }*/
 
     rq->client->z_level = ANTD_CNONE;
     proxy_cl = (antd_client_t *)malloc(sizeof(antd_client_t));
@@ -303,61 +358,21 @@ void *handle(void *data)
     proxy_cl->state = -1;
     dput(rq->request, "PROXY", proxy_cl);
     // send header
-    str = __s("%s %s HTTP/1.1\r\n", method, query);
-    size = strlen(str);
-    ret = antd_send(proxy_cl, str, size);
-    free(str);
-    for_each_assoc(it, xheader)
+    size = proxy_send_header(rq, proxy_cl);
+    if (size == -1)
     {
-        str = __s("%s: %s\r\n", it->key, (char *)it->value);
-        size = strlen(str);
-        ret = antd_send(proxy_cl, str, size);
-        free(str);
-        if (ret != size)
-        {
-            ERROR("Unable to send headers to proxy sent %d expected %d", ret, size);
-            antd_error(rq->client, 500, "Unable to send headers to proxy");
-            (void)close(proxy_cl->sock);
-            return task;
-        }
+        antd_error(rq->client, 500, "Unable to send headers to proxy");
+        return task;
     }
-    (void)antd_send(proxy_cl, "\r\n", 2);
     // send raw body if any
 
     if (EQU(method, "POST"))
     {
-        size = -1;
-        if (clen_str)
-            size = atoi(clen_str);
-        if (size == -1)
-        {
-            ERROR("Content length header not found or invalid");
-            antd_error(rq->client, 400, "Content length not provided");
-            (void)close(proxy_cl->sock);
-            return task;
-        }
-        do
-        {
-            ret = antd_recv_upto(rq->client, buf, BUFFLEN);
-            if (ret < 0)
-            {
-                ERROR("Unable to read request content");
-                antd_error(rq->client, 400, "Unable to read request content");
-                (void)close(proxy_cl->sock);
-                return task;
-            }
-            if (ret > 0)
-            {
-                size -= ret;
-                if (antd_send(proxy_cl, buf, ret) != ret)
-                {
-                    ERROR("Unable to send request body to peer");
-                    antd_error(rq->client, 500, "Unable to send request content via proxy");
-                    (void)close(proxy_cl->sock);
-                    return task;
-                }
-            }
-        } while (size > 0);
+        proxy_cl->state = size;
+        task->handle = proxy_send_post_data;
+        antd_task_bind_event(task, proxy_cl->sock, 0, TASK_EVT_ON_WRITABLE);
+        task->access_time = rq->client->last_io;
+        return task;
     }
     // wait for data
     task->handle = proxy_monitor_header;
