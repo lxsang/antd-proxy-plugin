@@ -104,7 +104,7 @@ static void *proxy_monitor_data(void *data)
     }
     task->handle = proxy_monitor_data;
     task->access_time = rq->client->last_io;
-    antd_task_bind_event(task, rq->client->sock, 0, TASK_EVT_ON_WRITABLE);
+    antd_task_bind_event(task, rq->client->sock, 0, TASK_EVT_ON_WRITABLE | TASK_EVT_ON_READABLE);
     return task;
 }
 
@@ -203,7 +203,7 @@ static void *proxy_monitor_header(void *data)
             }
             rq->client->state = clen;
             antd_send_header(rq->client, &rhd);
-            antd_task_bind_event(task, rq->client->sock, 0, TASK_EVT_ON_WRITABLE);
+            antd_task_bind_event(task, rq->client->sock, 0,  TASK_EVT_ON_WRITABLE | TASK_EVT_ON_READABLE);
             task->handle = proxy_monitor_data;
             return task;
         }
@@ -277,7 +277,7 @@ void *handle(void *data)
     //set_nonblock(proxy.fd);
     struct timeval timeout;
     timeout.tv_sec = 0;
-    timeout.tv_usec = 5*POLL_EVENT_TO*1000;
+    timeout.tv_usec = POLL_EVENT_TO*1000;
     if (setsockopt(proxy.fd, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout, sizeof(timeout)) < 0)
     {
         ERROR("setsockopt failed:%s", strerror(errno));
