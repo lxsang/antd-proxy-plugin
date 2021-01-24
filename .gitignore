@@ -1,6 +1,10 @@
 # Prerequisites
+plugins
+build
+*._*
 *.d
-
+*.deb
+.vscode
 # Object files
 *.o
 *.ko
@@ -45,8 +49,25 @@
 # Kernel Module Compile Results
 *.mod*
 *.cmd
-.tmp_versions/
 modules.order
 Module.symvers
-Mkfile.old
-dkms.conf
+Makefile.old
+dkms.con
+.DS_Store
+.*
+*.cache
+Makefile
+antd
+compile
+config.guess
+depcomp
+install-sh
+missing
+libtool
+config.log
+config.status
+config.sub
+configure
+aclocal.m4
+ltmain.sh
+Makefile.in
